@@ -340,6 +340,17 @@ static void vcp_open_task(void *arg) {
         vcp.reset();
         xSemaphoreGive(vcp_mutex);
 
+        // One physical failure can report both CDC_ACM_HOST_ERROR and
+        // CDC_ACM_HOST_DEVICE_DISCONNECTED. The first wakes this task; the
+        // second may arrive after the take and leave the binary semaphore set.
+        // Once close() returns the old device can no longer call handle_event,
+        // so any token still present belongs to that closed generation. Drain
+        // it before opening the replacement or the new device is immediately
+        // mistaken for disconnected and its published VID/PID is cleared.
+        while (xSemaphoreTake(device_disconnected_sem, 0) == pdTRUE) {
+            ESP_LOGD(TAG, "Discarded stale VCP disconnect event");
+        }
+
         std::unique_ptr<CdcAcmDevice> dev(VCP::open(&dev_config));
 
         if (dev == nullptr) {
