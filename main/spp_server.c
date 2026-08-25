@@ -224,8 +224,12 @@ static const uint8_t spp_data_receive_val[SPP_DATA_MAX_LEN] = {0x00};
 static const uint8_t spp_data_notify_val[SPP_DATA_MAX_LEN] = {0x00};
 static const uint8_t spp_data_notify_ccc[2] = {0x00, 0x00};
 
-/// Control lines: bit0 = DTR, bit1 = RTS, both deasserted by default
-static const uint8_t ctrl_lines_val[1] = {0x00};
+/// Control lines characteristic. A 1-byte write sets DTR (bit0) / RTS
+/// (bit1) immediately. An even-length write is a timed batch: pairs of
+/// [line state, delay in 10ms units], executed on the bridge with local
+/// timing so BLE latency cannot distort reset sequences.
+#define CTRL_SEQ_MAX 64
+static const uint8_t ctrl_lines_val[CTRL_SEQ_MAX] = {0x00};
 /// Line coding, USB CDC layout: 115200 baud, 1 stop bit, no parity, 8 data
 static const uint8_t line_coding_val[7] = {0x00, 0xC2, 0x01, 0x00, 0, 0, 8};
 /// Serial state bitmap (USB CDC SerialState), updated from the USB side
@@ -288,8 +292,7 @@ static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] = {
     [SPP_IDX_CTRL_VAL] = {{ESP_GATT_AUTO_RSP},
                           {ESP_UUID_LEN_128, (uint8_t *)nus_ctrl_uuid,
                            ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                           sizeof(ctrl_lines_val), sizeof(ctrl_lines_val),
-                           (uint8_t *)ctrl_lines_val}},
+                           CTRL_SEQ_MAX, 1, (uint8_t *)ctrl_lines_val}},
 
     // Line Coding Characteristic Declaration
     [SPP_IDX_LINE_CHAR] = {{ESP_GATT_AUTO_RSP},
@@ -629,7 +632,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                 }
                 cmdBuf.spp_event_id = BLE_WRITE_EVT;
             } else if (idx == SPP_IDX_CTRL_VAL) {
-                if (param->write.len != sizeof(ctrl_lines_val)) {
+                // 1 byte: raw line state; even length: timed batch of
+                // [state, delay] pairs
+                if (param->write.len != 1 &&
+                    (param->write.len % 2 != 0 ||
+                     param->write.len > CTRL_SEQ_MAX)) {
                     ESP_LOGE(__FUNCTION__, "Bad control lines length: %d",
                              param->write.len);
                     break;

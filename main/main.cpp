@@ -172,12 +172,32 @@ static void uart_tx_task(void *pvParameters) {
         }
 
         if (cmdBuf.spp_event_id == BLE_SET_CTRL_EVT) {
-            cur_ctrl_lines = cmdBuf.payload[0];
-            esp_err_t ctrl_err = vcp->set_control_line_state(
-                cur_ctrl_lines & 0x01, cur_ctrl_lines & 0x02);
-            if (ctrl_err != ESP_OK) {
-                ESP_LOGW(TAG, "set_control_line_state failed: %s",
-                         esp_err_to_name(ctrl_err));
+            if (cmdBuf.length == 1) {
+                cur_ctrl_lines = cmdBuf.payload[0];
+                esp_err_t ctrl_err = vcp->set_control_line_state(
+                    cur_ctrl_lines & 0x01, cur_ctrl_lines & 0x02);
+                if (ctrl_err != ESP_OK) {
+                    ESP_LOGW(TAG, "set_control_line_state failed: %s",
+                             esp_err_to_name(ctrl_err));
+                }
+            } else {
+                // Timed batch: [state, delay/10ms] pairs, executed with
+                // local timing so BLE latency cannot distort sequences
+                // like the USB-Serial-JTAG bootloader reset
+                ESP_LOGI(TAG, "ctrl sequence, %u steps", cmdBuf.length / 2);
+                for (uint16_t i = 0; i + 1 < cmdBuf.length; i += 2) {
+                    cur_ctrl_lines = cmdBuf.payload[i] & 0x03;
+                    esp_err_t ctrl_err = vcp->set_control_line_state(
+                        cur_ctrl_lines & 0x01, cur_ctrl_lines & 0x02);
+                    if (ctrl_err != ESP_OK) {
+                        ESP_LOGW(TAG, "ctrl sequence step %u failed: %s",
+                                 i / 2, esp_err_to_name(ctrl_err));
+                        break;
+                    }
+                    if (cmdBuf.payload[i + 1]) {
+                        vTaskDelay(pdMS_TO_TICKS(cmdBuf.payload[i + 1] * 10));
+                    }
+                }
             }
         } else if (cmdBuf.spp_event_id == BLE_SET_LINE_EVT) {
             memcpy(&cur_line_coding, cmdBuf.payload, sizeof(cur_line_coding));
