@@ -14,6 +14,8 @@ typedef enum {
     BLE_SET_CTRL_EVT,   // client wrote DTR/RTS bitmask (1 byte)
     BLE_SET_LINE_EVT,   // client wrote line coding (7 bytes, USB CDC layout)
     SERIAL_STATE_EVT,   // USB serial state bitmap for BLE notify (2 bytes LE)
+    DEVICE_INFO_EVT,    // downstream USB identity for BLE notify (5 bytes:
+                        // VID LE16, PID LE16, flags bit0 = device present)
 } COMMAND;
 
 #define SPP_DATA_MAX_LEN 512

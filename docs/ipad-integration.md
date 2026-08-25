@@ -13,10 +13,11 @@ ESP32-S3 VCP-BT Bridge 把一个 USB 串口设备（CP210x / CH34x / FTDI）桥�
 | 控制线特征 | `6E400004-B5A3-F393-E0A9-E50E24DCCA9E`，Write / Read，1 字节 |
 | 线路参数特征 | `6E400005-B5A3-F393-E0A9-E50E24DCCA9E`，Write / Read，7 字节 |
 | 串口状态特征 | `6E400006-B5A3-F393-E0A9-E50E24DCCA9E`，Notify / Read，2 字节 |
+| 设备信息特征 | `6E400007-B5A3-F393-E0A9-E50E24DCCA9E`，Notify / Read，5 字节 |
 | 配对 | 不需要，连接即用 |
 | 串口默认参数（USB 侧） | 115200 8N1，可通过线路参数特征动态修改 |
 
-写入 RX 特征的字节会原样发往 USB 串口；USB 串口收到的字节通过 TX 特征的 notify 推送给 iPad。数据是透明字节流，无帧格式、无转义。`0002`/`0003` 是标准 NUS，现成的 NUS 终端 App 可直接使用；`0004`–`0006` 是本设备的串口控制扩展，NUS App 会自动忽略。
+写入 RX 特征的字节会原样发往 USB 串口；USB 串口收到的字节通过 TX 特征的 notify 推送给 iPad。数据是透明字节流，无帧格式、无转义。`0002`/`0003` 是标准 NUS，现成的 NUS 终端 App 可直接使用；`0004`–`0007` 是本设备的串口控制扩展，NUS App 会自动忽略。
 
 ## 串口控制特征
 
@@ -75,6 +76,21 @@ USB 串口设备拔插后线状态回到无效（不回放旧状态），需要�
 
 订阅方式与 TX 特征相同（`setNotifyValue(true)`）。注意各芯片支持程度不同（FTDI 最全，CH34x 部分支持）。
 
+### 设备信息 `6E400007`（下游 USB 身份，设备 → iPad）
+
+5 字节，桥所连 USB 串口设备的身份，attach 时置值、拔出时清零并 notify：
+
+| 偏移 | 长度 | 含义 |
+|---|---|---|
+| 0 | 2 | idVendor，小端 uint16 |
+| 2 | 2 | idProduct，小端 uint16 |
+| 4 | 1 | flags：bit0 = 设备在位（0 时前 4 字节无意义） |
+
+连接后 read 一次即得当前态；订阅 notify 可跟踪运行中的插拔。用途：把真实的
+USB VID/PID 透传给上层（如 iPad 端 Linux guest 的 /sys），让 esptool 之类的
+工具按设备类型自动选复位策略——例如 `303A:1001`（乐鑫 USB-Serial-JTAG）时
+esptool 原生改用 USB-JTAG 专用序列，而不是为 EN/IO0 电路设计的经典序列。
+
 ### 暂不支持
 
 Send Break：ESP-IDF 的 VCP 驱动中只有 CP210x 实现了 break，CH34x 和 FTDI 未实现，故未暴露。
@@ -112,6 +128,7 @@ enum NUS {
     static let ctrl    = CBUUID(string: "6E400004-B5A3-F393-E0A9-E50E24DCCA9E") // DTR/RTS
     static let line    = CBUUID(string: "6E400005-B5A3-F393-E0A9-E50E24DCCA9E") // 波特率等
     static let state   = CBUUID(string: "6E400006-B5A3-F393-E0A9-E50E24DCCA9E") // CTS/DSR 等
+    static let devinfo = CBUUID(string: "6E400007-B5A3-F393-E0A9-E50E24DCCA9E") // 下游 USB VID/PID
 }
 
 final class SerialBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {

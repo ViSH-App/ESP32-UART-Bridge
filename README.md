@@ -3,7 +3,8 @@
 Wireless serial port for USB devices. An ESP32-S3 acts as a USB host for a
 USB-serial adapter (CP210x, CH34x, FTDI, ...) and exposes it over BLE using the
 **Nordic UART Service (NUS)** — the de-facto standard for BLE serial — extended
-with characteristics for full serial control (DTR/RTS, baud rate, line status).
+with characteristics for full serial control (DTR/RTS, baud rate, line
+status) and downstream device identity.
 
 Typical uses: configuring headless gear over a console port without a cable,
 and **flashing ESP32 targets over the air with unmodified esptool / PlatformIO**
@@ -42,9 +43,13 @@ Advertised name: `ESP32_BRIDGE`. No pairing required.
 | Control lines | `0004` | Write / Read | DTR/RTS bitmask (1 B) or timed batch (2–64 B) |
 | Line coding | `0005` | Write / Read | USB CDC layout, 7 B: baud (LE u32), stop, parity, data bits |
 | Serial state | `0006` | Notify / Read | USB serial state bitmap (2 B LE) |
+| Device info | `0007` | Notify / Read | Downstream USB VID/PID + present flag (5 B) |
 
-`0002`/`0003` are plain NUS; the `0004`–`0006` extensions are ignored by
-generic NUS apps. USB side defaults to 115200 8N1 until changed via `0005`.
+`0002`/`0003` are plain NUS; the `0004`–`0007` extensions are ignored by
+generic NUS apps. `0007` carries the attached USB device's identity
+(VID LE16, PID LE16, flags bit0 = present; zeros while nothing is attached)
+so clients can surface the real device — e.g. letting esptool pick its
+USB-Serial-JTAG reset strategy natively. USB side defaults to 115200 8N1 until changed via `0005`.
 See [docs/ipad-integration.md](docs/ipad-integration.md) for the full protocol,
 including the bootloader-reset batch sequences.
 

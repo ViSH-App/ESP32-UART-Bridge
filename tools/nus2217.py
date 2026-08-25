@@ -18,6 +18,9 @@ Protocol (see docs/ipad-integration.md):
     6E400004  control lines, 1 byte: bit0 DTR, bit1 RTS (write)
     6E400005  line coding, 7 bytes: baud LE32, stop, parity, data (write)
     6E400006  serial state, 2 bytes LE, USB CDC SerialState bitmap (notify)
+    6E400007  device info, 5 bytes: downstream USB VID LE16 + PID LE16 +
+              flags bit0=present (read/notify; unused here — RFC2217
+              cannot carry a USB PID)
 """
 import argparse
 import asyncio

@@ -64,6 +64,10 @@ enum {
     SPP_IDX_STATE_VAL,
     SPP_IDX_STATE_CFG,
 
+    SPP_IDX_DEVINFO_CHAR,
+    SPP_IDX_DEVINFO_VAL,
+    SPP_IDX_DEVINFO_CFG,
+
     SPP_IDX_NB,
 };
 
@@ -85,6 +89,11 @@ static const uint8_t nus_tx_uuid[16] = {
  * 6E400005: line coding, 7 bytes, USB CDC layout:
  *           baud LE32 + stop bits + parity + data bits (write/read)
  * 6E400006: serial state, 2 bytes LE, USB CDC SerialState bitmap
+ *           (read/notify)
+ * 6E400007: device info, 5 bytes: downstream USB VID LE16 + PID LE16 +
+ *           flags (bit0 = device present); zeros while nothing is
+ *           attached. Lets clients surface the real USB identity (e.g.
+ *           so esptool picks the USB-Serial-JTAG reset strategy)
  *           (read/notify) */
 static const uint8_t nus_ctrl_uuid[16] = {
     0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
@@ -95,6 +104,9 @@ static const uint8_t nus_line_uuid[16] = {
 static const uint8_t nus_state_uuid[16] = {
     0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
     0x93, 0xF3, 0xA3, 0xB5, 0x06, 0x00, 0x40, 0x6E};
+static const uint8_t nus_devinfo_uuid[16] = {
+    0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+    0x93, 0xF3, 0xA3, 0xB5, 0x07, 0x00, 0x40, 0x6E};
 
 extern QueueHandle_t xQueueSpp;
 extern QueueHandle_t xQueueUartTX;
@@ -235,6 +247,9 @@ static const uint8_t line_coding_val[7] = {0x00, 0xC2, 0x01, 0x00, 0, 0, 8};
 /// Serial state bitmap (USB CDC SerialState), updated from the USB side
 static const uint8_t serial_state_val[2] = {0x00, 0x00};
 static const uint8_t serial_state_ccc[2] = {0x00, 0x00};
+/// Downstream USB identity: VID LE16, PID LE16, flags (bit0 = present)
+static const uint8_t device_info_val[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t device_info_ccc[2] = {0x00, 0x00};
 
 /// Full HRS Database Description - Used to add attributes into the database
 static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] = {
@@ -329,7 +344,29 @@ static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] = {
         {ESP_GATT_AUTO_RSP},
         {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid,
          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t),
-         sizeof(serial_state_ccc), (uint8_t *)serial_state_ccc}}};
+         sizeof(serial_state_ccc), (uint8_t *)serial_state_ccc}},
+
+    // Device Info Characteristic Declaration
+    [SPP_IDX_DEVINFO_CHAR] = {{ESP_GATT_AUTO_RSP},
+                              {ESP_UUID_LEN_16,
+                               (uint8_t *)&character_declaration_uuid,
+                               ESP_GATT_PERM_READ, CHAR_DECLARATION_SIZE,
+                               CHAR_DECLARATION_SIZE,
+                               (uint8_t *)&char_prop_read_notify}},
+
+    // Device Info Characteristic Value
+    [SPP_IDX_DEVINFO_VAL] = {{ESP_GATT_AUTO_RSP},
+                             {ESP_UUID_LEN_128, (uint8_t *)nus_devinfo_uuid,
+                              ESP_GATT_PERM_READ, sizeof(device_info_val),
+                              sizeof(device_info_val),
+                              (uint8_t *)device_info_val}},
+
+    // Device Info Client Characteristic Configuration Descriptor
+    [SPP_IDX_DEVINFO_CFG] = {
+        {ESP_GATT_AUTO_RSP},
+        {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid,
+         ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t),
+         sizeof(device_info_ccc), (uint8_t *)device_info_ccc}}};
 
 static char *esp_key_type_to_str(esp_ble_key_type_t key_type) {
     char *key_str = NULL;
@@ -1090,6 +1127,15 @@ void spp_task(void *arg) {
                 esp_ble_gatts_send_indicate(
                     spp_gatts_if, spp_conn_id,
                     spp_handle_table[SPP_IDX_STATE_VAL], cmdBuf.length,
+                    cmdBuf.payload, false);
+            }
+        } else if (cmdBuf.spp_event_id == DEVICE_INFO_EVT) {
+            esp_ble_gatts_set_attr_value(spp_handle_table[SPP_IDX_DEVINFO_VAL],
+                                         cmdBuf.length, cmdBuf.payload);
+            if (connected) {
+                esp_ble_gatts_send_indicate(
+                    spp_gatts_if, spp_conn_id,
+                    spp_handle_table[SPP_IDX_DEVINFO_VAL], cmdBuf.length,
                     cmdBuf.payload, false);
             }
         }

@@ -2,6 +2,8 @@
 
 把 BLE 桥暴露为 RFC2217 网络串口，esptool / PlatformIO / 任何 pyserial 程序可以原生使用，
 包括 DTR/RTS 复位和波特率切换（分别映射到 `6E400004` / `6E400005` 特征）。
+桥另有 `6E400007` 设备信息特征（下游 USB VID/PID）；RFC2217 无法承载 PID,
+代理不使用它——需要 PID 自动选复位策略的场景走 iPad/ViSH 集成路径。
 
 ## 启动
 

@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <atomic>
+
 #include "cmd.h"
 #include "driver/uart.h"
 #include "esp_bt_defs.h"
@@ -81,6 +83,42 @@ static cdc_acm_line_coding_t cur_line_coding = {
     .bDataBits = DATA_BITS,
 };
 static uint8_t cur_ctrl_lines = 0;  // bit0 = DTR, bit1 = RTS
+
+// Downstream USB identity. Captured in the host library's new-device
+// callback — the only context where the device descriptor is reachable —
+// and published over BLE (device info characteristic) only when the device
+// actually OPENS in vcp_open_task, so the value always describes the device
+// behind the data channel.
+static std::atomic<uint16_t> last_usb_vid{0};
+static std::atomic<uint16_t> last_usb_pid{0};
+
+static void usb_new_dev_cb(usb_device_handle_t usb_dev) {
+    const usb_device_desc_t *desc;
+    if (usb_host_get_device_descriptor(usb_dev, &desc) != ESP_OK) {
+        return;
+    }
+    if (desc->bDeviceClass == USB_CLASS_HUB) {
+        return;  // hubs fire this callback too; not a serial device
+    }
+    // USB host context: cache only, publishing happens on open
+    last_usb_vid.store(desc->idVendor);
+    last_usb_pid.store(desc->idProduct);
+    ESP_LOGI(TAG, "USB device attached: VID=0x%04X PID=0x%04X",
+             desc->idVendor, desc->idProduct);
+}
+
+/// Queue the device-info characteristic update (VID LE16, PID LE16, flags)
+static void publish_device_info(uint16_t vid, uint16_t pid, bool present) {
+    CMD_t cmdBuf;
+    cmdBuf.spp_event_id = DEVICE_INFO_EVT;
+    cmdBuf.length = 5;
+    cmdBuf.payload[0] = vid & 0xFF;
+    cmdBuf.payload[1] = (vid >> 8) & 0xFF;
+    cmdBuf.payload[2] = pid & 0xFF;
+    cmdBuf.payload[3] = (pid >> 8) & 0xFF;
+    cmdBuf.payload[4] = present ? 0x01 : 0x00;
+    xQueueSend(xQueueSpp, &cmdBuf, 0);
+}
 
 /**
  * @brief Device event callback
@@ -322,6 +360,7 @@ static void vcp_open_task(void *arg) {
         cur_ctrl_lines = 0;
 
         ESP_LOGI(TAG, "VCP device opened");
+        publish_device_info(last_usb_vid.load(), last_usb_pid.load(), true);
 
         xSemaphoreTake(led_sync, portMAX_DELAY);
         led_vcp = 1;
@@ -332,6 +371,7 @@ static void vcp_open_task(void *arg) {
         xSemaphoreGive(vcp_mutex);
 
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
+        publish_device_info(0, 0, false);
         vTaskDelay(10);
     }
 }
@@ -522,7 +562,7 @@ extern "C" void app_main(void) {
         .driver_task_stack_size = 4096,
         .driver_task_priority = 20,
         .xCoreID = 1,
-        .new_dev_cb = NULL,
+        .new_dev_cb = usb_new_dev_cb,
     };
     ESP_ERROR_CHECK(cdc_acm_host_install(&cdc_config));
 
