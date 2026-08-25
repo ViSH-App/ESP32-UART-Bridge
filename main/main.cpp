@@ -36,6 +36,9 @@ using namespace esp_usb;
 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
 #define LED_BLINK_TIME 60
+// Overall LED brightness, 0-255. WS2812 is very bright; keep this low.
+#define LED_LEVEL 16
+#define LED_LEVEL_DIM 4
 
 // These values should be the most common for USB-Serial devices
 #define BAUDRATE (115200)
@@ -64,8 +67,20 @@ TickType_t last_ble_activity = 0;
 #define BLE_TIMEOUT_MS \
     5000  // 5 seconds of inactivity before we consider BLE disconnected
 
-static void bt_log(const char *data);
 std::unique_ptr<CdcAcmDevice> vcp = nullptr;
+// Guards vcp's lifetime: uart_tx_task calls into the object while
+// vcp_open_task destroys/replaces it on USB reconnects
+static SemaphoreHandle_t vcp_mutex;
+
+// Serial settings last requested over BLE; re-applied when the USB serial
+// device (re)connects. Written only by uart_tx_task after startup.
+static cdc_acm_line_coding_t cur_line_coding = {
+    .dwDTERate = BAUDRATE,
+    .bCharFormat = STOP_BITS,
+    .bParityType = PARITY,
+    .bDataBits = DATA_BITS,
+};
+static uint8_t cur_ctrl_lines = 0;  // bit0 = DTR, bit1 = RTS
 
 /**
  * @brief Device event callback
@@ -77,40 +92,40 @@ std::unique_ptr<CdcAcmDevice> vcp = nullptr;
  */
 static void handle_event(const cdc_acm_host_dev_event_data_t *event,
                          void *user_ctx) {
-    char err_text[128];
+    // NOTE: never write status text into the BLE data channel here — it
+    // corrupts binary protocols (e.g. esptool SLIP framing) mid-stream
     switch (event->type) {
         case CDC_ACM_HOST_ERROR:
-            snprintf(err_text, sizeof(err_text),
-                     ">>CDC-ACM error has occurred, err_no = %d",
-                     event->data.error);
             xSemaphoreTake(led_sync, portMAX_DELAY);
             led_vcp = 0;
             xSemaphoreGive(led_sync);
 
-            ESP_LOGE(TAG, "%s", err_text);
-            bt_log(err_text);
-            break;
-        case CDC_ACM_HOST_DEVICE_DISCONNECTED:
-            snprintf(err_text, sizeof(err_text),
-                     ">>Device suddenly disconnected");
-            xSemaphoreTake(led_sync, portMAX_DELAY);
-            led_vcp = 0;
-            xSemaphoreGive(led_sync);
-
-            ESP_LOGI(TAG, "%s", err_text);
-            bt_log(err_text);
+            ESP_LOGE(TAG, "CDC-ACM error, err_no = %d", event->data.error);
+            // Treat transfer errors as a lost device: the target
+            // re-enumerating (e.g. reset into the ROM bootloader) can
+            // leave the open handle wedged with a dead IN pipe
             xSemaphoreGive(device_disconnected_sem);
             break;
-        case CDC_ACM_HOST_SERIAL_STATE:
-            snprintf(err_text, sizeof(err_text), "Serial state notif 0x%04X",
-                     event->data.serial_state.val);
+        case CDC_ACM_HOST_DEVICE_DISCONNECTED:
             xSemaphoreTake(led_sync, portMAX_DELAY);
             led_vcp = 0;
             xSemaphoreGive(led_sync);
 
-            ESP_LOGI(TAG, "%s", err_text);
-            bt_log(err_text);
+            ESP_LOGI(TAG, "Device suddenly disconnected");
+            xSemaphoreGive(device_disconnected_sem);
             break;
+        case CDC_ACM_HOST_SERIAL_STATE: {
+            ESP_LOGI(TAG, "Serial state notif 0x%04X",
+                     event->data.serial_state.val);
+            // Forward to BLE clients via the serial state characteristic
+            CMD_t cmdBuf;
+            cmdBuf.spp_event_id = SERIAL_STATE_EVT;
+            cmdBuf.length = 2;
+            cmdBuf.payload[0] = event->data.serial_state.val & 0xFF;
+            cmdBuf.payload[1] = (event->data.serial_state.val >> 8) & 0xFF;
+            xQueueSend(xQueueSpp, &cmdBuf, 0);
+            break;
+        }
         case CDC_ACM_HOST_NETWORK_CONNECTION:
         default:
             break;
@@ -141,25 +156,54 @@ static void uart_tx_task(void *pvParameters) {
     CMD_t cmdBuf;
 
     while (1) {
-        if (vcp == nullptr) {
-            // ESP_LOGI(TAG, "VCP device not open.");
-            vTaskDelay(100);
-            continue;
-        }
-
         xQueueReceive(xQueueUartTX, &cmdBuf, portMAX_DELAY);
-        BaseType_t err = vcp->tx_blocking(cmdBuf.payload, cmdBuf.length, 1000);
-        while (err == ESP_ERR_TIMEOUT) {
-            ESP_LOGE(TAG, "uart_tx_task Timeout");
-            vTaskDelay(15 / portTICK_PERIOD_MS);
-            err = vcp->tx_blocking(cmdBuf.payload, cmdBuf.length, 1000);
+
+        // All vcp use happens under vcp_mutex: vcp_open_task destroys and
+        // replaces the device object on reconnects, and calling into a
+        // destroyed CdcAcmDevice crashes (LoadProhibited in tx_blocking).
+        // The command is held, not dropped, while no device is open.
+        while (1) {
+            xSemaphoreTake(vcp_mutex, portMAX_DELAY);
+            if (vcp != nullptr) {
+                break;  // keep the mutex until the command is done
+            }
+            xSemaphoreGive(vcp_mutex);
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        BaseType_t sem = xSemaphoreTake(led_sync, 1);
-        if (sem == pdTRUE) {
-            led_tx = 1;
-            xSemaphoreGive(led_sync);
+        if (cmdBuf.spp_event_id == BLE_SET_CTRL_EVT) {
+            cur_ctrl_lines = cmdBuf.payload[0];
+            esp_err_t ctrl_err = vcp->set_control_line_state(
+                cur_ctrl_lines & 0x01, cur_ctrl_lines & 0x02);
+            if (ctrl_err != ESP_OK) {
+                ESP_LOGW(TAG, "set_control_line_state failed: %s",
+                         esp_err_to_name(ctrl_err));
+            }
+        } else if (cmdBuf.spp_event_id == BLE_SET_LINE_EVT) {
+            memcpy(&cur_line_coding, cmdBuf.payload, sizeof(cur_line_coding));
+            esp_err_t line_err = vcp->line_coding_set(&cur_line_coding);
+            if (line_err != ESP_OK) {
+                ESP_LOGW(TAG, "line_coding_set failed: %s",
+                         esp_err_to_name(line_err));
+            } else {
+                ESP_LOGI(TAG, "Line coding: %" PRIu32 " baud",
+                         cur_line_coding.dwDTERate);
+            }
+        } else {
+            // Single attempt, drop on failure: the timed-out transfer may
+            // still complete, so resending risks duplicating bytes in the
+            // stream. Retries belong to the protocol above, not here.
+            esp_err_t err = vcp->tx_blocking(cmdBuf.payload, cmdBuf.length, 1000);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "uart tx dropped %u bytes: %s", cmdBuf.length,
+                         esp_err_to_name(err));
+            } else if (xSemaphoreTake(led_sync, 1) == pdTRUE) {
+                led_tx = 1;
+                xSemaphoreGive(led_sync);
+            }
         }
+
+        xSemaphoreGive(vcp_mutex);
     }  // end while
     // Never reach here
     vTaskDelete(NULL);
@@ -200,8 +244,9 @@ static bool handle_rx(const uint8_t *data, size_t data_len, void *arg) {
         data_len -= chunk;
     }
     last_ble_activity = xTaskGetTickCount();
-    BaseType_t sem = xSemaphoreTake(led_sync, portMAX_DELAY);
-    if (sem == pdTRUE) {
+    // Never block the CDC data callback: a stalled callback stops IN
+    // transfers and the device side (e.g. ROM bootloader) drops output
+    if (xSemaphoreTake(led_sync, 0) == pdTRUE) {
         led_rx = 1;
         xSemaphoreGive(led_sync);
     }
@@ -220,49 +265,54 @@ static void vcp_open_task(void *arg) {
             .user_arg = NULL,
         };
 
-        vcp = std::unique_ptr<CdcAcmDevice>(VCP::open(&dev_config));
+        // Retract the previous device before reopening. Destruction happens
+        // under vcp_mutex so uart_tx_task can never be inside a call on the
+        // dying object.
+        xSemaphoreTake(vcp_mutex, portMAX_DELAY);
+        vcp.reset();
+        xSemaphoreGive(vcp_mutex);
 
-        if (vcp == nullptr) {
-            // ESP_LOGI(TAG, "Failed to open VCP device");
-            bt_log(">>Failed to open VCP device");
+        std::unique_ptr<CdcAcmDevice> dev(VCP::open(&dev_config));
+
+        if (dev == nullptr) {
+            // Not a known vendor VCP chip; try any standard CDC-ACM device
+            // (e.g. an ESP32's native USB-Serial-JTAG port)
+            auto cdc = std::make_unique<CdcAcmDevice>();
+            if (cdc->open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID, 0, &dev_config) ==
+                ESP_OK) {
+                ESP_LOGI(TAG, "Opened generic CDC-ACM device");
+                dev = std::move(cdc);
+            }
+        }
+
+        if (dev == nullptr) {
+            ESP_LOGD(TAG, "Failed to open VCP device");
             continue;
         }
         vTaskDelay(10);
 
-        cdc_acm_line_coding_t line_coding = {
-            .dwDTERate = BAUDRATE,
-            .bCharFormat = STOP_BITS,
-            .bParityType = PARITY,
-            .bDataBits = DATA_BITS,
-        };
-        ESP_ERROR_CHECK(vcp->line_coding_set(&line_coding));
+        // Restore the line coding last requested over BLE. Control lines
+        // intentionally start deasserted: replaying a stale mid-reset
+        // DTR/RTS state can hold the freshly enumerated target in reset
+        // (open/disconnect storm).
+        if (dev->line_coding_set(&cur_line_coding) != ESP_OK) {
+            ESP_LOGW(TAG, "line_coding_set on open failed, reopening");
+            continue;
+        }
+        cur_ctrl_lines = 0;
 
-        bt_log(">> Serial Device connected\n");
+        ESP_LOGI(TAG, "VCP device opened");
 
         xSemaphoreTake(led_sync, portMAX_DELAY);
         led_vcp = 1;
         xSemaphoreGive(led_sync);
+
+        xSemaphoreTake(vcp_mutex, portMAX_DELAY);
+        vcp = std::move(dev);
+        xSemaphoreGive(vcp_mutex);
+
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
         vTaskDelay(10);
-    }
-}
-
-static void bt_log(const char *data) {
-    size_t offset = 0;
-    size_t data_len = strlen(data);
-    while (data_len > 0) {
-        CMD_t cmdBuf;
-        size_t chunk =
-            data_len > SPP_DATA_MAX_LEN ? SPP_DATA_MAX_LEN : data_len;
-        cmdBuf.spp_event_id = BLE_UART_EVT;
-        cmdBuf.length = chunk;
-        memcpy(cmdBuf.payload, data + offset, chunk);
-        BaseType_t err = xQueueSend(xQueueSpp, &cmdBuf, portMAX_DELAY);
-        if (err != pdTRUE) {
-            ESP_LOGE(pcTaskGetName(NULL), "xQueueSend Fail");
-        }
-        offset += chunk;
-        data_len -= chunk;
     }
 }
 
@@ -326,61 +376,19 @@ static void ledTask(void *arg) {
         xSemaphoreGive(led_sync);
 
         uint8_t r = 0, g = 0, b = 0;
-        if (l_ble) {             // BLE connected
-            if (l_rx && l_tx) {  // Both RX and TX - yellow
-                r = 100;
-                g = 100;
-                b = 0;
-            } else if (l_rx) {  // RX only - red
-                r = 100;
-                g = 0;
-                b = 0;
-            } else if (l_tx) {  // TX only - green
-                r = 0;
-                g = 100;
-                b = 0;
-            } else {  // No traffic - purple
-                r = 80;
-                g = 0;
-                b = 80;
-            }
-        } else if (l_vcp) {  // USB-Serial connected
-            if (l_rx && l_tx) {
-                r = 100;
-                g = 100;
-                b = 0;
-            } else if (l_rx) {
-                r = 100;
-                g = 0;
-                b = 0;
-            } else if (l_tx) {
-                r = 0;
-                g = 100;
-                b = 0;
-            } else {
-                r = 0;
-                g = 0;
-                b = 20;
-            }
-        } else {  // Nothing connected
-            if (l_rx && l_tx) {
-                r = 100;
-                g = 100;
-                b = 0;
-            } else if (l_rx) {
-                r = 100;
-                g = 0;
-                b = 0;
-            } else if (l_tx) {
-                r = 0;
-                g = 100;
-                b = 0;
-            } else {
-                r = 0;
-                g = 0;
-                b = 0;
-            }
-        }
+        if (l_rx && l_tx) {  // Both RX and TX - yellow
+            r = LED_LEVEL;
+            g = LED_LEVEL;
+        } else if (l_rx) {  // RX only - red
+            r = LED_LEVEL;
+        } else if (l_tx) {  // TX only - green
+            g = LED_LEVEL;
+        } else if (l_ble) {  // BLE connected, no traffic - purple
+            r = LED_LEVEL_DIM;
+            b = LED_LEVEL_DIM;
+        } else if (l_vcp) {  // USB-Serial connected, no traffic - blue
+            b = LED_LEVEL_DIM;
+        }  // Nothing connected - off
         ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, r, g, b));
         ESP_ERROR_CHECK(led_strip_refresh(led_strip));
         vTaskDelay(LED_BLINK_TIME / portTICK_PERIOD_MS);
@@ -463,6 +471,8 @@ extern "C" void app_main(void) {
     assert(device_disconnected_sem);
 
     led_sync = xSemaphoreCreateMutex();
+    vcp_mutex = xSemaphoreCreateMutex();
+    assert(vcp_mutex);
 
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
@@ -480,13 +490,21 @@ extern "C" void app_main(void) {
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
-    // Create a task that will handle USB library events
-    BaseType_t task_created =
-        xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, 10, NULL);
+    // Create a task that will handle USB library events.
+    // High priority, pinned to core 1 (Bluedroid owns core 0): slow IN
+    // transfer turnaround makes USB serial devices drop TX data
+    BaseType_t task_created = xTaskCreatePinnedToCore(
+        usb_lib_task, "usb_lib", 4096, NULL, 15, NULL, 1);
     assert(task_created == pdTRUE);
 
     // ESP_LOGI(TAG, "Installing CDC-ACM driver");
-    ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
+    cdc_acm_host_driver_config_t cdc_config = {
+        .driver_task_stack_size = 4096,
+        .driver_task_priority = 20,
+        .xCoreID = 1,
+        .new_dev_cb = NULL,
+    };
+    ESP_ERROR_CHECK(cdc_acm_host_install(&cdc_config));
 
     // Register VCP drivers to VCP service
     VCP::register_driver<FT23x>();
