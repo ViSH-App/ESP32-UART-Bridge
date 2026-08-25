@@ -11,6 +11,7 @@
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "freertos/FreeRTOS.h"
@@ -212,6 +213,7 @@ static void uart_tx_task(void *pvParameters) {
         if (cmdBuf.spp_event_id == BLE_SET_CTRL_EVT) {
             if (cmdBuf.length == 1) {
                 cur_ctrl_lines = cmdBuf.payload[0];
+                ESP_LOGD(TAG, "ctrl line state 0x%02x", cur_ctrl_lines);
                 esp_err_t ctrl_err = vcp->set_control_line_state(
                     cur_ctrl_lines & 0x01, cur_ctrl_lines & 0x02);
                 if (ctrl_err != ESP_OK) {
@@ -223,14 +225,22 @@ static void uart_tx_task(void *pvParameters) {
                 // local timing so BLE latency cannot distort sequences
                 // like the USB-Serial-JTAG bootloader reset
                 ESP_LOGI(TAG, "ctrl sequence, %u steps", cmdBuf.length / 2);
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, cmdBuf.payload, cmdBuf.length,
+                                         ESP_LOG_DEBUG);
                 for (uint16_t i = 0; i + 1 < cmdBuf.length; i += 2) {
                     cur_ctrl_lines = cmdBuf.payload[i] & 0x03;
+                    int64_t step_t0 = esp_timer_get_time();
                     esp_err_t ctrl_err = vcp->set_control_line_state(
                         cur_ctrl_lines & 0x01, cur_ctrl_lines & 0x02);
+                    int64_t step_us = esp_timer_get_time() - step_t0;
                     if (ctrl_err != ESP_OK) {
                         ESP_LOGW(TAG, "ctrl sequence step %u failed: %s",
                                  i / 2, esp_err_to_name(ctrl_err));
                         break;
+                    }
+                    if (step_us > 20000) {
+                        ESP_LOGW(TAG, "ctrl step %u (0x%02x) slow: %lld us",
+                                 i / 2, cur_ctrl_lines, step_us);
                     }
                     if (cmdBuf.payload[i + 1]) {
                         vTaskDelay(pdMS_TO_TICKS(cmdBuf.payload[i + 1] * 10));

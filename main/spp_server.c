@@ -641,6 +641,22 @@ static uint8_t find_char_and_desr_index(uint16_t handle) {
     return error;
 }
 
+/// True when the client has subscribed the characteristic whose CCC sits
+/// at spp_handle_table[cfg_idx]. Notifying an unsubscribed client is not
+/// just impolite: a client mid-service-discovery drowns in the stream, ATT
+/// requests time out, and CoreBluetooth gives up the connection (seen live
+/// with a boot-looping downstream flooding the data channel).
+static bool ccc_notify_enabled(int cfg_idx) {
+    uint16_t len = 0;
+    const uint8_t *val = NULL;
+    if (esp_ble_gatts_get_attr_value(spp_handle_table[cfg_idx], &len, &val) !=
+            ESP_OK ||
+        val == NULL || len < 2) {
+        return false;
+    }
+    return (val[0] & 0x01) != 0;
+}
+
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                                         esp_gatt_if_t gatts_if,
                                         esp_ble_gatts_cb_param_t *param) {
@@ -1009,7 +1025,7 @@ void spp_task(void *arg) {
             led_ble = 0;
             xSemaphoreGive(led_sync);
         } else if (cmdBuf.spp_event_id == BLE_UART_EVT) {
-            if (connected) {
+            if (connected && ccc_notify_enabled(SPP_IDX_SPP_DATA_NOTIFY_CFG)) {
                 // Coalesce all serial data already waiting in the queue
                 // into MTU-sized notifications: underfilled ATT packets
                 // are the main throughput killer
@@ -1123,7 +1139,7 @@ void spp_task(void *arg) {
         } else if (cmdBuf.spp_event_id == SERIAL_STATE_EVT) {
             esp_ble_gatts_set_attr_value(spp_handle_table[SPP_IDX_STATE_VAL],
                                          cmdBuf.length, cmdBuf.payload);
-            if (connected) {
+            if (connected && ccc_notify_enabled(SPP_IDX_STATE_CFG)) {
                 esp_ble_gatts_send_indicate(
                     spp_gatts_if, spp_conn_id,
                     spp_handle_table[SPP_IDX_STATE_VAL], cmdBuf.length,
@@ -1132,7 +1148,7 @@ void spp_task(void *arg) {
         } else if (cmdBuf.spp_event_id == DEVICE_INFO_EVT) {
             esp_ble_gatts_set_attr_value(spp_handle_table[SPP_IDX_DEVINFO_VAL],
                                          cmdBuf.length, cmdBuf.payload);
-            if (connected) {
+            if (connected && ccc_notify_enabled(SPP_IDX_DEVINFO_CFG)) {
                 esp_ble_gatts_send_indicate(
                     spp_gatts_if, spp_conn_id,
                     spp_handle_table[SPP_IDX_DEVINFO_VAL], cmdBuf.length,
