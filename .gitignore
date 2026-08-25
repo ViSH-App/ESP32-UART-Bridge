@@ -1,0 +1,9 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.devcontainer/
+.vscode/
+dependencies.lock
+sdkconfig.esp32-s3-n8r2
+.pio/
