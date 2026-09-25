@@ -27,10 +27,13 @@ through the included RFC2217 proxy.
 
 ## Hardware
 
-- ESP32-S3 dev board (tested on ESP32-S3-DevKitC-1, 8 MB flash)
-- A USB-serial adapter attached to the S3's USB-OTG port
-  (some boards need a solder bridge to enable USB-OTG host power)
-- WS2812 RGB LED on GPIO 48 (integrated on ESP32-S3-WROOM-1 devkits)
+- **[YD-ESP32-S3](https://github.com/vcc-gnd/YD-ESP32-S3)** by VCC-GND
+  Studio, with an ESP32-S3-WROOM-1 module.
+- Connect the downstream USB-serial adapter to the **native ESP32-S3 USB-OTG
+  Type-C port** (GPIO19 / GPIO20). The other Type-C port uses the onboard
+  **CH343P USB-to-UART bridge** for programming and serial communication
+  with the ESP32-S3.
+- Onboard **WS2812 RGB LED on GPIO48**, used for bridge status.
 
 ## GATT interface
 
@@ -56,6 +59,11 @@ including the bootloader-reset batch sequences.
 ## Building
 
 ### PlatformIO
+
+The actual board is YD-ESP32-S3. `platformio.ini` uses
+`esp32-s3-devkitc-1` as its build definition; this is not the hardware model.
+The existing `esp32-s3-n8r2` environment configures 8 MB flash. Check the
+installed module's memory variant before using that configuration on another board.
 
 ```sh
 pio run -t upload            # env: esp32-s3-n8r2
